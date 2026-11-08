@@ -1,0 +1,85 @@
+name: Worker Static Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  worker-tests:
+    name: Worker contract tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements-test.txt
+      - name: Install test dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements-test.txt
+      - name: Run static worker contracts
+        id: pytest
+        run: |
+          mkdir -p test-results
+          python -m pytest tests -q --junitxml=test-results/worker.xml
+      - name: Upload worker test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: worker-test-results
+          path: test-results/worker.xml
+          retention-days: 14
+          if-no-files-found: error
+      - name: Write worker summary
+        if: always()
+        env:
+          PYTEST_OUTCOME: ${{ steps.pytest.outcome }}
+        run: |
+          python - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+
+          outcome = os.environ.get('PYTEST_OUTCOME', 'unknown')
+          path = 'test-results/worker.xml'
+          if outcome in ('cancelled', 'skipped'):
+              status = 'NOT RUN'
+              detail = f'pytest step {outcome}'
+          elif os.path.exists(path):
+              root = ET.parse(path).getroot()
+              suite = root.find('testsuite') if root.tag == 'testsuites' else root
+              tests = int(suite.get('tests', '0'))
+              failures = int(suite.get('failures', '0'))
+              errors = int(suite.get('errors', '0'))
+              skipped = int(suite.get('skipped', '0'))
+              if failures + errors > 0:
+                  status = 'FAIL'
+              elif tests == 0:
+                  status = 'FAIL' if outcome == 'failure' else 'NOT RUN'
+              elif skipped > 0:
+                  status = 'BLOCKED'
+              else:
+                  status = 'PASS'
+              if outcome == 'failure' and status == 'PASS':
+                  status = 'FAIL'
+              detail = f'tests={tests}, failures={failures}, errors={errors}, skipped={skipped}'
+          else:
+              status = 'FAIL' if outcome == 'failure' else 'NOT RUN'
+              detail = 'pytest failed before producing JUnit XML' if outcome == 'failure' else 'no JUnit XML'
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as f:
+              f.write('### Worker contract tests\n\n')
+              f.write(f"- Outcome: {os.environ.get('PYTEST_OUTCOME', 'unknown')}\n")
+              f.write(f'- Result: {status} ({detail})\n')
+              f.write(f"- Commit: {os.environ.get('GITHUB_SHA', 'unknown')}\n")
+          PY
