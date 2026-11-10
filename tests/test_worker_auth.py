@@ -73,3 +73,19 @@ def test_worker_token_rejects_wrong_issuer(monkeypatch):
     with pytest.raises(worker_auth.WorkerAuthError) as error:
         worker_auth.verify_worker_token(_token("test-secret", jti="iss-1", iss="other"), "tts")
     assert error.value.status_code == 401
+
+
+def test_worker_token_rejects_revoked_jti(monkeypatch):
+    monkeypatch.setenv("WORKER_JOB_TOKEN_SECRET", "test-secret")
+    monkeypatch.setenv("WORKER_REVOKED_JTIS", "revoked-1")
+    with pytest.raises(worker_auth.WorkerAuthError) as error:
+        worker_auth.verify_worker_token(_token("test-secret", jti="revoked-1"), "tts")
+    assert error.value.status_code == 401
+
+
+def test_worker_token_binds_request_project():
+    claims = {"job_id": "job-1", "project_id": "project-1", "tenant_id": "tenant-1", "user_id": "user-1"}
+    worker_auth.assert_request_binding(claims, {"project_id": "project-1"})
+    with pytest.raises(worker_auth.WorkerAuthError) as error:
+        worker_auth.assert_request_binding(claims, {"project_id": "project-2"})
+    assert error.value.status_code == 403

@@ -38,6 +38,20 @@ def _b64url_decode(value: str) -> bytes:
     return base64.urlsafe_b64decode(value + padding)
 
 
+def _revoked_jtis() -> set:
+    return {item.strip() for item in os.getenv("WORKER_REVOKED_JTIS", "").split(",") if item.strip()}
+
+
+def assert_request_binding(claims: dict, payload) -> None:
+    if not isinstance(payload, dict):
+        return
+    for field in ("job_id", "project_id", "tenant_id", "user_id"):
+        expected = claims.get(field)
+        actual = payload.get(field)
+        if actual is not None and expected is not None and str(actual) != str(expected):
+            raise WorkerAuthError(403, f"Worker token is not bound to request {field}.")
+
+
 def _purge_replay(now: int) -> None:
     for key, expires_at in list(_REPLAY_CACHE.items()):
         if expires_at <= now:
@@ -87,6 +101,8 @@ def verify_worker_token(token: str, required_scope: str) -> dict:
         raise WorkerAuthError(401, detail="Worker token has expired.")
     if not isinstance(issued_at, int) or issued_at > now + CLOCK_SKEW_SECONDS:
         raise WorkerAuthError(401, detail="Worker token issued-at is invalid.")
+    if claims["jti"] in _revoked_jtis():
+        raise WorkerAuthError(401, "Worker token has been revoked.")
     scopes = claims.get("scope")
     if not isinstance(scopes, list) or required_scope not in scopes:
         raise WorkerAuthError(403, detail=f"Worker token is missing scope {required_scope}.")
@@ -106,9 +122,17 @@ async def worker_auth_middleware(request, call_next):
     if not authorization.startswith("Bearer "):
         return JSONResponse(status_code=401, content={"detail": "Bearer worker token required."})
     try:
-        request.state.worker_claims = verify_worker_token(authorization[7:].strip(), required_scope)
+        claims = verify_worker_token(authorization[7:].strip(), required_scope)
+        content_type = request.headers.get("content-type", "")
+        if "application/json" in content_type:
+            raw_body = await request.body()
+            if raw_body:
+                assert_request_binding(claims, json.loads(raw_body))
+        request.state.worker_claims = claims
     except WorkerAuthError as error:
         return JSONResponse(status_code=error.status_code, content={"detail": error.detail})
+    except Exception:
+        return JSONResponse(status_code=400, content={"detail": "Invalid worker request body."})
     return await call_next(request)
 
 
