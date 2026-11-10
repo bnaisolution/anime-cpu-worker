@@ -15,7 +15,10 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import uvicorn
 
+from worker_auth import install_worker_auth
+
 app = FastAPI(title="AI Cinematic Anime Engine - GitHub CPU Worker (Svara TTS & FFmpeg)")
+install_worker_auth(app)
 
 DEFAULT_TG_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 DEFAULT_TG_CHAT_ID = os.getenv("TELEGRAM_STORAGE_CHAT_ID", "")
