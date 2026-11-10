@@ -4,6 +4,7 @@ import pathlib
 import subprocess
 import tempfile
 import types
+from typing import Any, Dict, List, Optional
 
 import pytest
 
@@ -46,10 +47,10 @@ def load_functions(*names):
         "TelegramUploadConfig": DummyModel,
         "TtsSynthesisRequest": DummyModel,
         "FfmpegEpisodeRequest": DummyModel,
-        "List": list,
-        "Dict": dict,
-        "Any": object,
-        "Optional": lambda value: value,
+        "List": List,
+        "Dict": Dict,
+        "Any": Any,
+        "Optional": Optional,
     }
     exec(compile(module, str(MAIN), "exec"), namespace)
     return namespace
