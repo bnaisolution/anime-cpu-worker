@@ -295,3 +295,49 @@ def test_health_endpoint_contract():
     assert payload["ok"] is True
     assert payload["worker"] == "github-cpu-worker"
     assert "Svara" in payload["tts_engine"]
+
+
+def route_paths():
+    routes = set()
+    for node in ast.parse(SOURCE).body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for decorator in node.decorator_list:
+            if not isinstance(decorator, ast.Call):
+                continue
+            func = decorator.func
+            if (
+                isinstance(func, ast.Attribute)
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "app"
+                and func.attr in {"get", "post", "put", "delete", "patch"}
+                and decorator.args
+                and isinstance(decorator.args[0], ast.Constant)
+            ):
+                routes.add((func.attr.upper(), decorator.args[0].value))
+    return routes
+
+
+def test_worker_routes_match_expected_public_contract():
+    assert route_paths() == {
+        ("POST", "/v1/tts/svara"),
+        ("POST", "/v1/tts/supertonic"),
+        ("POST", "/v1/ffmpeg/render-episode"),
+        ("GET", "/health"),
+    }
+
+
+def test_worker_has_no_shell_execution_or_hardcoded_telegram_secrets():
+    assert "shell=True" not in SOURCE
+    assert "os.system(" not in SOURCE
+    assert 'DEFAULT_TG_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")' in SOURCE
+    assert 'DEFAULT_TG_CHAT_ID = os.getenv("TELEGRAM_STORAGE_CHAT_ID", "")' in SOURCE
+    assert "sk-" not in SOURCE
+    assert "bot[0-9]" not in SOURCE
+
+
+def test_health_endpoint_does_not_echo_secrets():
+    source = function_source("health")
+    assert "TOKEN" not in source
+    assert "CHAT_ID" not in source
+    assert "os.getenv" not in source
