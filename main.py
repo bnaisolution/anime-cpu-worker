@@ -126,6 +126,9 @@ class SceneManifestItem(BaseModel):
     video_input_url: Optional[str] = None
     image_input_url: Optional[str] = None
     voice_audio_url: Optional[str] = None
+    video_input_telegram_file_id: Optional[str] = None
+    image_input_telegram_file_id: Optional[str] = None
+    voice_audio_telegram_file_id: Optional[str] = None
     has_dialogue: bool = False
     subtitle_text: str = ""
     bgm_track_url: Optional[str] = None
@@ -238,9 +241,48 @@ def _safe_remote_url(url: str) -> bool:
         return False
 
 
-def download_file(url: str, dest_path: str) -> bool:
+def download_telegram_file(
+    file_id: str, dest_path: str, tg_cfg: Optional[TelegramUploadConfig]
+) -> bool:
+    bot_token = (tg_cfg.bot_token if tg_cfg and tg_cfg.bot_token else DEFAULT_TG_BOT_TOKEN).strip()
+    if not bot_token or not file_id:
+        return False
+    try:
+        meta = requests.get(
+            f"https://api.telegram.org/bot{bot_token}/getFile",
+            params={"file_id": file_id},
+            timeout=30,
+        )
+        if not meta.ok:
+            return False
+        tg_path = (meta.json().get("result") or {}).get("file_path")
+        if not tg_path:
+            return False
+        with requests.get(
+            f"https://api.telegram.org/file/bot{bot_token}/{tg_path}",
+            stream=True,
+            timeout=120,
+        ) as resp:
+            if not resp.ok:
+                return False
+            with open(dest_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=65536):
+                    if not chunk:
+                        continue
+                    f.write(chunk)
+        return os.path.exists(dest_path) and os.path.getsize(dest_path) > 0
+    except Exception as exc:
+        print(f"[DOWNLOAD WARN] Telegram file download failed: {type(exc).__name__}")
+        return False
+
+
+def download_file(
+    url: str, dest_path: str, tg_cfg: Optional[TelegramUploadConfig] = None
+) -> bool:
     if not url:
         return False
+    if url.startswith("tg://"):
+        return download_telegram_file(url[5:], dest_path, tg_cfg)
     try:
         headers = {"Bypass-Tunnel-Reminder": "true", "User-Agent": "AnimeEngineCPUWorker/1.0"}
         current = url
@@ -586,14 +628,20 @@ def render_single_scene_segment(
     sc: SceneManifestItem,
     tmpdir: str,
     idx: int,
+    tg_cfg: Optional[TelegramUploadConfig] = None,
 ) -> Dict[str, Any]:
     seg_video_out = os.path.join(tmpdir, f"seg_video_{idx:03d}.mp4")
     seg_voice_out = os.path.join(tmpdir, f"seg_voice_{idx:03d}.wav")
 
     raw_voice = os.path.join(tmpdir, f"raw_voice_{idx:03d}.wav")
     has_voice_file = False
-    if sc.voice_audio_url:
-        has_voice_file = download_file(sc.voice_audio_url, raw_voice)
+    voice_source = (
+        f"tg://{sc.voice_audio_telegram_file_id}"
+        if sc.voice_audio_telegram_file_id
+        else sc.voice_audio_url
+    )
+    if voice_source:
+        has_voice_file = download_file(voice_source, raw_voice, tg_cfg)
 
     scene_dur = float(sc.duration_sec or 5.0)
     if has_voice_file:
@@ -686,9 +734,17 @@ def render_single_scene_segment(
             timeout=60,
         )
 
-    visual_url = sc.video_input_url or sc.image_input_url
+    visual_source = (
+        f"tg://{sc.video_input_telegram_file_id}"
+        if sc.video_input_telegram_file_id
+        else (
+            f"tg://{sc.image_input_telegram_file_id}"
+            if sc.image_input_telegram_file_id
+            else (sc.video_input_url or sc.image_input_url)
+        )
+    )
     raw_visual = os.path.join(tmpdir, f"raw_visual_{idx:03d}")
-    has_visual = download_file(visual_url or "", raw_visual)
+    has_visual = download_file(visual_source or "", raw_visual, tg_cfg)
 
     total_frames = max(24, int(round(scene_dur * 24)))
     cam_type = (sc.camera_motion_type or "KEN_BURNS").upper()
@@ -849,7 +905,7 @@ def render_episode(req: FfmpegEpisodeRequest):
             cursor_sec = 0.0
 
             for idx, sc in enumerate(sorted_scenes):
-                seg = render_single_scene_segment(sc, tmpdir, idx)
+                seg = render_single_scene_segment(sc, tmpdir, idx, req.telegram_upload)
                 rendered_segments.append(seg)
                 dur = seg["duration_sec"]
                 if seg["subtitle_text"]:
