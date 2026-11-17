@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 import os
+import ipaddress
 import json
 import shutil
+import socket
 import tempfile
 import threading
 import subprocess
 from typing import List, Dict, Any, Optional
+from urllib.parse import urljoin, urlparse
 
 import torch
 import numpy as np
@@ -25,8 +28,10 @@ DEFAULT_TG_CHAT_ID = os.getenv("TELEGRAM_STORAGE_CHAT_ID", "")
 DEFAULT_STREAM_BRIDGE = os.getenv(
     "TELEGRAM_STREAM_BRIDGE_URL", "https://api.bnai.dpdns.org/v1/media/telegram"
 ).rstrip("/")
+TELEGRAM_MAX_UPLOAD_BYTES = int(os.getenv("TELEGRAM_MAX_UPLOAD_BYTES", str(49 * 1024 * 1024)))
+MAX_DOWNLOAD_BYTES = int(os.getenv("WORKER_MAX_DOWNLOAD_BYTES", str(200 * 1024 * 1024)))
 
-# Open-Source Commercial-Safe Models (Apache 2.0 / CC-BY)
+# Svara + SNAC are Apache-2.0/MIT. MMS Hindi VITS is CC-BY-NC-4.0 and is dev/test only.
 SVARA_MODEL_ID = os.getenv("SVARA_MODEL_ID", "kenpath/svara-tts-v1")
 SNAC_MODEL_ID = os.getenv("SNAC_MODEL_ID", "hubertsiuzdak/snac_24khz")
 VITS_HINDI_MODEL_ID = os.getenv("VITS_HINDI_MODEL_ID", "facebook/mms-tts-hin")
@@ -185,21 +190,91 @@ def upload_to_telegram(
     return {"file_id": None, "telegram_url": None}
 
 
+def deliver_output(
+    file_path: str,
+    caption: str,
+    tg_cfg: Optional[TelegramUploadConfig],
+) -> Dict[str, Optional[str]]:
+    """Uploads generated output and fails loudly when storage is expected but unavailable."""
+    if not os.path.exists(file_path) or os.path.getsize(file_path) <= 0:
+        raise HTTPException(status_code=500, detail="Generated output file is missing or empty.")
+    if os.path.getsize(file_path) > TELEGRAM_MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Generated output exceeds Telegram document limit ({TELEGRAM_MAX_UPLOAD_BYTES} bytes).",
+        )
+    result = upload_to_telegram(file_path, caption, tg_cfg)
+    explicitly_disabled = tg_cfg is not None and getattr(tg_cfg, "enabled", True) is False
+    if explicitly_disabled:
+        return result
+    if not result.get("file_id"):
+        raise HTTPException(
+            status_code=502,
+            detail="Telegram storage upload failed or is not configured. Check bot token and chat id.",
+        )
+    return result
+
+
+def _safe_remote_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return False
+        if parsed.username or parsed.password:
+            return False
+        host = parsed.hostname.strip().lower()
+        if host in {"localhost", "metadata", "metadata.google.internal"}:
+            return False
+        infos = socket.getaddrinfo(host, None)
+        if not infos:
+            return False
+        for info in infos:
+            address = info[4][0].split("%", 1)[0]
+            ip = ipaddress.ip_address(address)
+            if not ip.is_global:
+                return False
+        return True
+    except Exception:
+        return False
+
+
 def download_file(url: str, dest_path: str) -> bool:
-    if not url or not url.startswith("http"):
+    if not url:
         return False
     try:
         headers = {"Bypass-Tunnel-Reminder": "true", "User-Agent": "AnimeEngineCPUWorker/1.0"}
-        with requests.get(url, headers=headers, stream=True, timeout=60) as r:
-            if not r.ok:
+        current = url
+        for _ in range(4):
+            if not _safe_remote_url(current):
+                print("[DOWNLOAD WARN] Rejected non-public URL")
                 return False
-            with open(dest_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=65536):
-                    if chunk:
+            with requests.get(
+                current, headers=headers, stream=True, timeout=60, allow_redirects=False
+            ) as r:
+                if getattr(r, "is_redirect", False):
+                    location = getattr(r, "headers", {}).get("location")
+                    if not location:
+                        return False
+                    current = urljoin(current, location)
+                    continue
+                if not r.ok:
+                    return False
+                declared = int(getattr(r, "headers", {}).get("Content-Length") or 0)
+                if declared > MAX_DOWNLOAD_BYTES:
+                    return False
+                written = 0
+                with open(dest_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=65536):
+                        if not chunk:
+                            continue
+                        written += len(chunk)
+                        if written > MAX_DOWNLOAD_BYTES:
+                            raise ValueError("download exceeds size limit")
                         f.write(chunk)
-        return os.path.exists(dest_path) and os.path.getsize(dest_path) > 0
+                return os.path.exists(dest_path) and os.path.getsize(dest_path) > 0
+        return False
     except Exception as exc:
-        print(f"[DOWNLOAD WARN] Failed {url}: {exc}")
+        print(f"[DOWNLOAD WARN] Failed remote asset: {type(exc).__name__}")
         return False
 
 
@@ -259,7 +334,7 @@ def load_fast_hindi_vits_engine():
     from transformers import VitsModel, AutoTokenizer
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[SVARA-VITS] Loading commercial-safe {VITS_HINDI_MODEL_ID} on {device}...")
+    print(f"[SVARA-VITS] Loading dev/test VITS fallback {VITS_HINDI_MODEL_ID} on {device}...")
     tokenizer = AutoTokenizer.from_pretrained(VITS_HINDI_MODEL_ID)
     model = VitsModel.from_pretrained(VITS_HINDI_MODEL_ID).to(device)
     model.eval()
@@ -427,12 +502,20 @@ def run_tts_pipeline(req: TtsSynthesisRequest) -> Dict[str, Any]:
             f"🎙️ [{req.provider}] Project: {req.project_id} | Ep: {req.episode_no} | "
             f"Scene: {req.scene_order} | Voice: {req.voice_id} ({req.emotion})"
         )
-        tg_res = upload_to_telegram(final_wav, caption, req.telegram_upload)
+        tg_res = deliver_output(final_wav, caption, req.telegram_upload)
+        full_svara = SVARA_ENGINE_MODE.upper() == "FULL_LLM" or (
+            SVARA_ENGINE_MODE.upper() == "AUTO" and torch.cuda.is_available()
+        )
+        license_label = (
+            "Apache-2.0 (Svara-TTS/SNAC)"
+            if full_svara
+            else "CC-BY-NC-4.0 (MMS Hindi VITS; DEV/TEST ONLY)"
+        )
 
         return {
             "ok": True,
             "provider": req.provider,
-            "license": "OPEN_SOURCE_COMMERCIAL_SAFE",
+            "license": license_label,
             "voice_id": req.voice_id,
             "duration_sec": round(duration_sec, 2),
             "file_size_bytes": file_size,
@@ -533,6 +616,7 @@ def render_single_scene_segment(
                 seg_voice_out,
             ],
             check=True,
+            timeout=90,
         )
     else:
         subprocess.run(
@@ -550,6 +634,7 @@ def render_single_scene_segment(
                 seg_voice_out,
             ],
             check=True,
+            timeout=60,
         )
 
     seg_sfx_out = os.path.join(tmpdir, f"seg_sfx_{idx:03d}.wav")
@@ -580,6 +665,7 @@ def render_single_scene_segment(
                 seg_sfx_out,
             ],
             check=True,
+            timeout=90,
         )
     else:
         subprocess.run(
@@ -597,6 +683,7 @@ def render_single_scene_segment(
                 seg_sfx_out,
             ],
             check=True,
+            timeout=60,
         )
 
     visual_url = sc.video_input_url or sc.image_input_url
@@ -617,18 +704,38 @@ def render_single_scene_segment(
                     "-select_streams",
                     "v:0",
                     "-show_entries",
-                    "stream=nb_frames,codec_name",
+                    "stream=codec_type,codec_name,avg_frame_rate,duration,nb_frames",
                     "-of",
                     "json",
                     raw_visual,
                 ],
                 text=True,
+                timeout=15,
             )
             streams = json.loads(probe_out).get("streams", [])
             if streams:
-                codec = streams[0].get("codec_name", "")
-                nb = int(streams[0].get("nb_frames") or 1)
-                if codec in ("h264", "hevc", "vp9", "mpeg4") and nb > 1:
+                stream = streams[0]
+                codec = str(stream.get("codec_name") or "").lower()
+                image_codecs = {"png", "mjpeg", "bmp", "gif", "webp", "tiff"}
+                frame_rate = str(stream.get("avg_frame_rate") or "0/0")
+                try:
+                    numerator, denominator = frame_rate.split("/", 1)
+                    fps = float(numerator) / float(denominator) if float(denominator) else 0.0
+                except Exception:
+                    fps = 0.0
+                try:
+                    duration = float(stream.get("duration") or 0)
+                except Exception:
+                    duration = 0.0
+                try:
+                    frames = int(stream.get("nb_frames") or 0)
+                except Exception:
+                    frames = 0
+                if (
+                    stream.get("codec_type") == "video"
+                    and codec not in image_codecs
+                    and (frames > 1 or duration > 0.1 or fps > 0.0)
+                ):
                     is_video_stream = True
         except Exception:
             is_video_stream = False
@@ -654,17 +761,20 @@ def render_single_scene_segment(
                     seg_video_out,
                 ],
                 check=True,
+                timeout=180,
             )
         else:
             if cam_type in ("KEN_BURNS", "ZOOM"):
                 vf = (
-                    f"scale=2560:1440,zoompan=z='min(zoom+0.0012,1.25)':"
+                    f"scale=2560:1440:force_original_aspect_ratio=increase,crop=2560:1440,"
+                    f"zoompan=z='min(zoom+0.0012,1.25)':"
                     f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
                     f"d={total_frames}:s=1280x720:fps=24,format=yuv420p"
                 )
             elif cam_type == "PAN":
                 vf = (
-                    f"scale=2560:1440,zoompan=z=1.15:"
+                    f"scale=2560:1440:force_original_aspect_ratio=increase,crop=2560:1440,"
+                    f"zoompan=z=1.15:"
                     f"x='(iw-iw/zoom)*(on/{total_frames})':y='ih/2-(ih/zoom/2)':"
                     f"d={total_frames}:s=1280x720:fps=24,format=yuv420p"
                 )
@@ -691,6 +801,7 @@ def render_single_scene_segment(
                     seg_video_out,
                 ],
                 check=True,
+                timeout=180,
             )
     else:
         subprocess.run(
@@ -710,6 +821,7 @@ def render_single_scene_segment(
                 seg_video_out,
             ],
             check=True,
+            timeout=60,
         )
 
     return {
@@ -771,14 +883,17 @@ def render_episode(req: FfmpegEpisodeRequest):
             subprocess.run(
                 ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", vid_list_txt, "-c", "copy", concat_vid],
                 check=True,
+                timeout=120,
             )
             subprocess.run(
                 ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", voice_list_txt, "-c", "copy", concat_voice],
                 check=True,
+                timeout=120,
             )
             subprocess.run(
                 ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", sfx_list_txt, "-c", "copy", concat_sfx],
                 check=True,
+                timeout=120,
             )
 
             bgm_wav = os.path.join(tmpdir, "bgm_master.wav")
@@ -806,6 +921,7 @@ def render_episode(req: FfmpegEpisodeRequest):
                         bgm_wav,
                     ],
                     check=True,
+                    timeout=180,
                 )
             else:
                 subprocess.run(
@@ -823,6 +939,7 @@ def render_episode(req: FfmpegEpisodeRequest):
                         bgm_wav,
                     ],
                     check=True,
+                    timeout=60,
                 )
 
             ass_path = os.path.join(tmpdir, "episode_subtitles.ass")
@@ -890,7 +1007,7 @@ def render_episode(req: FfmpegEpisodeRequest):
                 f"🎬 [MASTER EPISODE] Project: {req.project_id} | Episode: {req.episode_no} | "
                 f"Scenes: {len(sorted_scenes)} | Duration: {round(total_ep_duration, 1)}s"
             )
-            tg_res = upload_to_telegram(final_mp4, caption, req.telegram_upload)
+            tg_res = deliver_output(final_mp4, caption, req.telegram_upload)
 
             return {
                 "ok": True,
@@ -915,7 +1032,8 @@ def health():
     return {
         "ok": True,
         "worker": "github-cpu-worker",
-        "tts_engine": "Svara-TTS v1 + Open-Source Hindi VITS (Apache 2.0 / Commercial Safe)",
+        "tts_engine": "Svara-TTS v1 (Apache-2.0) + MMS Hindi VITS (CC-BY-NC-4.0 dev/test)",
+        "license_mode": "DEV_TEST" if SVARA_ENGINE_MODE.upper() != "FULL_LLM" else "COMMERCIAL_REVIEW_REQUIRED",
     }
 
 

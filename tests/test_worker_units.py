@@ -1,10 +1,13 @@
 import ast
+import ipaddress
 import os
 import pathlib
+import socket
 import subprocess
 import tempfile
 import types
 from typing import Any, Dict, List, Optional
+from urllib.parse import urljoin, urlparse
 
 import pytest
 
@@ -26,7 +29,7 @@ class DummyModel:
 
 
 def load_functions(*names):
-    wanted = set(names)
+    wanted = set(names) | {"_safe_remote_url"}
     nodes = []
     for node in TREE.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in wanted:
@@ -44,6 +47,13 @@ def load_functions(*names):
         "DEFAULT_TG_BOT_TOKEN": "",
         "DEFAULT_TG_CHAT_ID": "",
         "DEFAULT_STREAM_BRIDGE": "https://bridge.test",
+        "TELEGRAM_MAX_UPLOAD_BYTES": 49 * 1024 * 1024,
+        "SVARA_ENGINE_MODE": "FAST_CPU_VITS",
+        "MAX_DOWNLOAD_BYTES": 200 * 1024 * 1024,
+        "socket": socket,
+        "ipaddress": ipaddress,
+        "urljoin": urljoin,
+        "urlparse": urlparse,
         "TelegramUploadConfig": DummyModel,
         "TtsSynthesisRequest": DummyModel,
         "FfmpegEpisodeRequest": DummyModel,
@@ -163,6 +173,9 @@ class FakeResponse:
 def test_download_file_rejects_unsafe_urls_and_reports_failures(tmp_path):
     namespace = load_functions("download_file")
     called = []
+    namespace["socket"] = types.SimpleNamespace(
+        getaddrinfo=lambda *args, **kwargs: [(None, None, None, None, ("93.184.216.34", 0))]
+    )
 
     def get(url, **kwargs):
         called.append((url, kwargs))

@@ -30,7 +30,13 @@ SCOPE_BY_PATH = {
 
 
 def _secret() -> str:
-    return os.getenv("WORKER_JOB_TOKEN_SECRET") or os.getenv("WORKER_CALLBACK_SECRET") or ""
+    return (
+        os.getenv("WORKER_JOB_TOKEN_SECRET")
+        or os.getenv("WORKER_CALLBACK_SECRET")
+        or os.getenv("ANIME_WORKER_JOB_TOKEN_SECRET")
+        or os.getenv("ANIME_WORKER_CALLBACK_SECRET")
+        or ""
+    )
 
 
 def _b64url_decode(value: str) -> bytes:

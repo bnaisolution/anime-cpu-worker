@@ -3,9 +3,17 @@ name: Start Anime CPU Worker
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: anime-cpu-worker
+  cancel-in-progress: false
+
 jobs:
   run-worker:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -29,14 +37,47 @@ jobs:
         run: |
           pip install -r requirements.txt
 
-      - name: Start FastAPI Worker
+      - name: Validate Worker Secret
         env:
+          WORKER_JOB_TOKEN_SECRET: ${{ secrets.WORKER_JOB_TOKEN_SECRET }}
+        run: |
+          if [ -z "$WORKER_JOB_TOKEN_SECRET" ]; then
+            echo "::error::WORKER_JOB_TOKEN_SECRET is missing. Add it to repository Actions secrets."
+            exit 1
+          fi
+
+      - name: Start Worker and Tunnel
+        env:
+          WORKER_JOB_TOKEN_SECRET: ${{ secrets.WORKER_JOB_TOKEN_SECRET }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_STORAGE_CHAT_ID: ${{ secrets.TELEGRAM_STORAGE_CHAT_ID }}
+          SVARA_ENGINE_MODE: FAST_CPU_VITS
+          WORKER_SUBDOMAIN: ${{ vars.WORKER_SUBDOMAIN }}
         run: |
-          python main.py &
-          sleep 15
-
-      - name: Start LocalTunnel
-        run: |
-          npx localtunnel --port 8000
+          set -euo pipefail
+          python main.py > worker.log 2>&1 &
+          worker_pid=$!
+          ready=0
+          for _ in $(seq 1 45); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer invalid' http://127.0.0.1:8000/health || true)
+            if [ "$code" = "401" ] || [ "$code" = "200" ]; then
+              ready=1
+              break
+            fi
+            if ! kill -0 "$worker_pid" 2>/dev/null; then
+              echo "::error::Worker exited before becoming ready."
+              tail -n 120 worker.log
+              exit 1
+            fi
+            sleep 2
+          done
+          if [ "$ready" != "1" ]; then
+            echo "::error::Worker did not become ready."
+            tail -n 120 worker.log
+            exit 1
+          fi
+          if [ -n "${WORKER_SUBDOMAIN:-}" ]; then
+            npx --yes localtunnel@2.0.2 --port 8000 --subdomain "$WORKER_SUBDOMAIN"
+          else
+            npx --yes localtunnel@2.0.2 --port 8000
+          fi
