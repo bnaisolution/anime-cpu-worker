@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: anime-cpu-worker
@@ -105,4 +105,10 @@ jobs:
 
           echo "WORKER_TUNNEL_URL=$tunnel_url" >> "$GITHUB_STEP_SUMMARY"
           echo "worker_tunnel_url=$tunnel_url"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          printf '%s' "$tunnel_url" > worker-url.txt
+          git add worker-url.txt
+          git commit -m "ci: publish worker tunnel url" >/dev/null
+          git push --force origin HEAD:ci/worker-url
           tail -f /tmp/cloudflared.log
