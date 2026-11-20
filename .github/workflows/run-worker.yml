@@ -76,8 +76,33 @@ jobs:
             tail -n 120 worker.log
             exit 1
           fi
-          if [ -n "${WORKER_SUBDOMAIN:-}" ]; then
-            npx --yes localtunnel@2.0.2 --port 8000 --subdomain "$WORKER_SUBDOMAIN"
-          else
-            npx --yes localtunnel@2.0.2 --port 8000
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -o /tmp/cloudflared
+          chmod +x /tmp/cloudflared
+
+          /tmp/cloudflared tunnel --url http://127.0.0.1:8000 --no-autoupdate \
+            > /tmp/cloudflared.log 2>&1 &
+          tunnel_pid=$!
+
+          tunnel_url=""
+          for _ in $(seq 1 60); do
+            tunnel_url=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1 || true)
+            if [ -n "$tunnel_url" ]; then
+              break
+            fi
+            if ! kill -0 "$tunnel_pid" 2>/dev/null; then
+              echo "::error::Cloudflare tunnel exited before publishing a URL."
+              tail -n 120 /tmp/cloudflared.log
+              exit 1
+            fi
+            sleep 2
+          done
+          if [ -z "$tunnel_url" ]; then
+            echo "::error::Cloudflare tunnel URL was not published."
+            tail -n 120 /tmp/cloudflared.log
+            exit 1
           fi
+
+          echo "WORKER_TUNNEL_URL=$tunnel_url" >> "$GITHUB_STEP_SUMMARY"
+          echo "worker_tunnel_url=$tunnel_url"
+          tail -f /tmp/cloudflared.log
