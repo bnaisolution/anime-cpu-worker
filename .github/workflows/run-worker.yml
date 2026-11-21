@@ -52,6 +52,8 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_STORAGE_CHAT_ID: ${{ secrets.TELEGRAM_STORAGE_CHAT_ID }}
           SVARA_ENGINE_MODE: FAST_CPU_VITS
+          WORKER_TOKEN_SINGLE_USE: "false"
+          WORKER_HEALTH_PUBLIC: "true"
           WORKER_SUBDOMAIN: ${{ vars.WORKER_SUBDOMAIN }}
         run: |
           set -euo pipefail
