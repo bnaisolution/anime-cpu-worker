@@ -818,7 +818,7 @@ def render_single_scene_segment(
                     "-t",
                     f"{scene_dur:.2f}",
                     "-vf",
-                    "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,fps=24,format=yuv420p",
+                    "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,fps=24,format=yuv420p",
                     "-an",
                     "-c:v",
                     "libx264",
@@ -845,7 +845,7 @@ def render_single_scene_segment(
                     f"d={total_frames}:s=1280x720:fps=24,format=yuv420p"
                 )
             else:
-                vf = "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,fps=24,format=yuv420p"
+                vf = "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,fps=24,format=yuv420p"
 
             subprocess.run(
                 [
