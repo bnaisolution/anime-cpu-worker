@@ -694,27 +694,37 @@ def render_single_scene_segment(
                 downloaded_sfx.append(sfx_path)
 
     if downloaded_sfx:
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-y",
-                "-i",
-                downloaded_sfx[0],
-                "-af",
-                f"volume=0.35,apad=whole_dur={scene_dur:.2f}",
-                "-t",
-                f"{scene_dur:.2f}",
-                "-ar",
-                "44100",
-                "-ac",
-                "2",
-                "-c:a",
-                "pcm_s16le",
-                seg_sfx_out,
-            ],
-            check=True,
-            timeout=90,
-        )
+        sfx_cmd = ["ffmpeg", "-y"]
+        sfx_filters = []
+        sfx_labels = []
+        for s_idx, sfx_path in enumerate(downloaded_sfx):
+            sfx_cmd += ["-i", sfx_path]
+            label = f"sfx{s_idx}"
+            sfx_filters.append(f"[{s_idx}:a]volume=0.35,apad[{label}]")
+            sfx_labels.append(f"[{label}]")
+        if len(sfx_labels) == 1:
+            sfx_filters.append(f"{sfx_labels[0]}atrim=0:{scene_dur:.2f},asetpts=N/SR/TB[sfx_out]")
+        else:
+            sfx_filters.append(
+                f"{''.join(sfx_labels)}amix=inputs={len(sfx_labels)}:duration=longest:dropout_transition=0.5,"
+                f"atrim=0:{scene_dur:.2f},asetpts=N/SR/TB[sfx_out]"
+            )
+        sfx_cmd += [
+            "-filter_complex",
+            ";".join(sfx_filters),
+            "-map",
+            "[sfx_out]",
+            "-t",
+            f"{scene_dur:.2f}",
+            "-ar",
+            "44100",
+            "-ac",
+            "2",
+            "-c:a",
+            "pcm_s16le",
+            seg_sfx_out,
+        ]
+        subprocess.run(sfx_cmd, check=True, timeout=120)
     else:
         subprocess.run(
             [
