@@ -354,3 +354,31 @@ def test_health_endpoint_does_not_echo_secrets():
     assert "TOKEN" not in source
     assert "CHAT_ID" not in source
     assert "os.getenv" not in source
+
+
+def test_ffmpeg_request_accepts_canonical_target_duration():
+    fields = schema_fields("FfmpegEpisodeRequest")
+    assert "target_duration_sec" in fields
+
+
+def test_render_episode_reports_duration_gate_without_forcing_scene_length():
+    source = function_source("render_episode")
+    assert "target_duration_sec" in source
+    assert "duration_status" in source
+    assert "duration_tolerance" in source
+    assert "duration_delta_sec" in source
+    assert "max(5.0, target_duration * 0.02)" in source
+
+
+def test_voice_fit_uses_atempo_instead_of_stretching_scene_to_voice():
+    source = function_source("fit_voice_to_scene")
+    assert "atempo" in source
+    assert "1.25" in source
+    assert "max(scene_dur" not in source
+
+
+def test_bgm_is_built_as_per_scene_segments():
+    source = function_source("build_bgm_timeline")
+    assert "segment_paths" in source
+    assert "bgm_seg_" in source
+    assert "first_bgm_url" not in SOURCE
