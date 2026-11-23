@@ -7,7 +7,7 @@ import socket
 import tempfile
 import threading
 import subprocess
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 import torch
@@ -140,6 +140,7 @@ class FfmpegEpisodeRequest(BaseModel):
     project_id: str
     episode_no: int
     engine: str = "GITHUB_CPU_FFMPEG"
+    target_duration_sec: Optional[float] = None
     ducking_db: float = -8.0
     crossfade_ms: int = 500
     target_loudness_lufs: float = -14.0
@@ -624,6 +625,85 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     return ass_path
 
 
+
+def fit_voice_to_scene(voice_dur: float, planned_dur: float) -> Tuple[float, str]:
+    """Keep the planned shot length unless the voice is materially longer."""
+    planned = max(1.0, float(planned_dur or 5.0))
+    voice = max(0.1, float(voice_dur or 0.1))
+    if voice <= max(0.5, planned - 0.05):
+        return planned, f"apad=whole_dur={planned:.2f}"
+    if voice <= planned * 1.12:
+        fitted = max(planned, voice + 0.15)
+        return fitted, f"apad=whole_dur={fitted:.2f}"
+    tempo = min(1.25, max(1.0, voice / max(0.5, planned - 0.10)))
+    return planned, f"atempo={tempo:.3f},apad=whole_dur={planned:.2f}"
+
+
+def build_bgm_timeline(
+    sorted_scenes: List[SceneManifestItem],
+    rendered_segments: List[Dict[str, Any]],
+    tmpdir: str,
+    output_path: str,
+    tg_cfg: Optional[TelegramUploadConfig] = None,
+) -> None:
+    """Build a per-scene BGM bed, preserving scene-level music changes."""
+    segment_paths: List[str] = []
+    cache: Dict[str, str] = {}
+    for idx, sc in enumerate(sorted_scenes):
+        duration = max(0.5, float(rendered_segments[idx].get("duration_sec") or sc.duration_sec or 5.0))
+        seg_path = os.path.join(tmpdir, f"bgm_seg_{idx:03d}.wav")
+        url = (sc.bgm_track_url or "").strip()
+        raw_path = cache.get(url)
+        if url and not raw_path:
+            raw_path = os.path.join(tmpdir, f"bgm_src_{len(cache):03d}.bin")
+            if download_file(url, raw_path, tg_cfg):
+                cache[url] = raw_path
+            else:
+                raw_path = None
+        if url and raw_path:
+            fade = min(0.35, duration / 4.0)
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-stream_loop", "-1", "-i", raw_path,
+                    "-t", f"{duration:.2f}",
+                    "-af", f"atrim=0:{duration:.2f},afade=t=in:st=0:d={fade:.2f},afade=t=out:st={max(0.0, duration - fade):.2f}:d={fade:.2f}",
+                    "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le", seg_path,
+                ],
+                check=True,
+                timeout=120,
+            )
+        else:
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                    "-t", f"{duration:.2f}", "-c:a", "pcm_s16le", seg_path,
+                ],
+                check=True,
+                timeout=60,
+            )
+        segment_paths.append(seg_path)
+
+    concat_list = os.path.join(tmpdir, "bgm_concat.txt")
+    with open(concat_list, "w", encoding="utf-8") as handle:
+        for path in segment_paths:
+            handle.write(f"file '{path}'\n")
+    if not segment_paths:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                "-t", "1.0", "-c:a", "pcm_s16le", output_path,
+            ],
+            check=True,
+            timeout=60,
+        )
+        return
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list, "-c:a", "pcm_s16le", output_path],
+        check=True,
+        timeout=180,
+    )
+
+
 def render_single_scene_segment(
     sc: SceneManifestItem,
     tmpdir: str,
@@ -646,7 +726,7 @@ def render_single_scene_segment(
     scene_dur = float(sc.duration_sec or 5.0)
     if has_voice_file:
         voice_dur = probe_duration(raw_voice, scene_dur)
-        scene_dur = max(scene_dur, voice_dur + 0.35)
+        scene_dur, voice_filter = fit_voice_to_scene(voice_dur, scene_dur)
         subprocess.run(
             [
                 "ffmpeg",
@@ -654,7 +734,7 @@ def render_single_scene_segment(
                 "-i",
                 raw_voice,
                 "-af",
-                f"apad=whole_dur={scene_dur:.2f}",
+                voice_filter,
                 "-ar",
                 "44100",
                 "-ac",
@@ -700,13 +780,13 @@ def render_single_scene_segment(
         for s_idx, sfx_path in enumerate(downloaded_sfx):
             sfx_cmd += ["-i", sfx_path]
             label = f"sfx{s_idx}"
-            sfx_filters.append(f"[{s_idx}:a]volume=0.35,apad[{label}]")
+            sfx_filters.append(f"[{s_idx}:a]volume=0.55,apad[{label}]")
             sfx_labels.append(f"[{label}]")
         if len(sfx_labels) == 1:
             sfx_filters.append(f"{sfx_labels[0]}atrim=0:{scene_dur:.2f},asetpts=N/SR/TB[sfx_out]")
         else:
             sfx_filters.append(
-                f"{''.join(sfx_labels)}amix=inputs={len(sfx_labels)}:duration=longest:dropout_transition=0.5,"
+                f"{''.join(sfx_labels)}amix=inputs={len(sfx_labels)}:duration=longest:dropout_transition=0.5:normalize=0,"
                 f"atrim=0:{scene_dur:.2f},asetpts=N/SR/TB[sfx_out]"
             )
         sfx_cmd += [
@@ -929,6 +1009,12 @@ def render_episode(req: FfmpegEpisodeRequest):
                 cursor_sec += dur
 
             total_ep_duration = max(1.0, cursor_sec)
+            target_duration = float(req.target_duration_sec or 0)
+            duration_delta = total_ep_duration - target_duration if target_duration > 0 else 0.0
+            duration_tolerance = max(5.0, target_duration * 0.02) if target_duration > 0 else 0.0
+            duration_status = "UNSPECIFIED"
+            if target_duration > 0:
+                duration_status = "PASS" if abs(duration_delta) <= duration_tolerance else "OUT_OF_TOLERANCE"
 
             vid_list_txt = os.path.join(tmpdir, "vid_list.txt")
             voice_list_txt = os.path.join(tmpdir, "voice_list.txt")
@@ -963,50 +1049,7 @@ def render_episode(req: FfmpegEpisodeRequest):
             )
 
             bgm_wav = os.path.join(tmpdir, "bgm_master.wav")
-            bgm_raw_dl = os.path.join(tmpdir, "bgm_raw.mp3")
-            first_bgm_url = next(
-                (s.bgm_track_url for s in sorted_scenes if s.bgm_track_url), None
-            )
-            if first_bgm_url and download_file(first_bgm_url, bgm_raw_dl):
-                subprocess.run(
-                    [
-                        "ffmpeg",
-                        "-y",
-                        "-stream_loop",
-                        "-1",
-                        "-i",
-                        bgm_raw_dl,
-                        "-t",
-                        f"{total_ep_duration:.2f}",
-                        "-ar",
-                        "44100",
-                        "-ac",
-                        "2",
-                        "-c:a",
-                        "pcm_s16le",
-                        bgm_wav,
-                    ],
-                    check=True,
-                    timeout=180,
-                )
-            else:
-                subprocess.run(
-                    [
-                        "ffmpeg",
-                        "-y",
-                        "-f",
-                        "lavfi",
-                        "-i",
-                        "anullsrc=r=44100:cl=stereo",
-                        "-t",
-                        f"{total_ep_duration:.2f}",
-                        "-c:a",
-                        "pcm_s16le",
-                        bgm_wav,
-                    ],
-                    check=True,
-                    timeout=60,
-                )
+            build_bgm_timeline(sorted_scenes, rendered_segments, tmpdir, bgm_wav, req.telegram_upload)
 
             ass_path = os.path.join(tmpdir, "episode_subtitles.ass")
             has_subs = req.burn_subtitles and len(subtitle_events) > 0
@@ -1018,9 +1061,9 @@ def render_episode(req: FfmpegEpisodeRequest):
             )
 
             audio_filter = (
-                "[2:a]volume=0.28[bgm_low];"
-                "[bgm_low][1:a]sidechaincompress=threshold=0.025:ratio=6:attack=40:release=400[bgm_ducked];"
-                "[1:a][bgm_ducked][3:a]amix=inputs=3:duration=first:dropout_transition=0.5[a_mixed];"
+                "[2:a]volume=0.38[bgm_low];"
+                "[bgm_low][1:a]sidechaincompress=threshold=0.025:ratio=4:attack=40:release=400[bgm_ducked];"
+                "[1:a][bgm_ducked][3:a]amix=inputs=3:duration=first:dropout_transition=0.5:normalize=0[a_mixed];"
                 f"[a_mixed]loudnorm=I={req.target_loudness_lufs}:TP=-1.5:LRA=11[audio_master]"
             )
 
@@ -1080,6 +1123,9 @@ def render_episode(req: FfmpegEpisodeRequest):
                 "engine": req.engine,
                 "episode_no": req.episode_no,
                 "duration_sec": round(total_ep_duration, 2),
+                "target_duration_sec": round(target_duration, 2) if target_duration > 0 else None,
+                "duration_delta_sec": round(duration_delta, 2) if target_duration > 0 else None,
+                "duration_status": duration_status,
                 "file_size_bytes": file_size,
                 "telegram_file_id": tg_res["file_id"],
                 "tg_file_id": tg_res["file_id"],
