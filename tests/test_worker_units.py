@@ -2,6 +2,7 @@ import ast
 import ipaddress
 import os
 import pathlib
+import re
 import socket
 import subprocess
 import tempfile
@@ -382,3 +383,33 @@ def test_bgm_is_built_as_per_scene_segments():
     assert "segment_paths" in source
     assert "bgm_seg_" in source
     assert "first_bgm_url" not in SOURCE
+
+
+def test_measure_audio_stats_parses_ffmpeg_volumedetect():
+    namespace = load_functions("measure_audio_stats")
+    namespace["re"] = re
+
+    class Result:
+        stderr = "[Parsed_volumedetect_0 @ 0x1] mean_volume: -18.4 dB\n[Parsed_volumedetect_0 @ 0x1] max_volume: -0.05 dB\n"
+
+    namespace["subprocess"] = types.SimpleNamespace(run=lambda *args, **kwargs: Result())
+    stats = namespace["measure_audio_stats"]("master.wav")
+    assert stats["mean_volume_db"] == -18.4
+    assert stats["max_volume_db"] == -0.05
+    assert stats["clipping_detected"] is True
+    assert stats["measured"] is True
+
+
+def test_measure_audio_stats_fails_safe():
+    namespace = load_functions("measure_audio_stats")
+    namespace["re"] = re
+    namespace["subprocess"] = types.SimpleNamespace(
+        run=lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("ffmpeg unavailable"))
+    )
+    stats = namespace["measure_audio_stats"]("missing.wav")
+    assert stats == {
+        "mean_volume_db": None,
+        "max_volume_db": None,
+        "clipping_detected": None,
+        "measured": False,
+    }

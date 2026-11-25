@@ -626,6 +626,34 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 
 
+def measure_audio_stats(path: str) -> Dict[str, Any]:
+    """Measures real audio loudness/clipping with ffmpeg (volumedetect)."""
+    stats: Dict[str, Any] = {
+        "mean_volume_db": None,
+        "max_volume_db": None,
+        "clipping_detected": None,
+        "measured": False,
+    }
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-i", path, "-af", "volumedetect", "-f", "null", "-"],
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        mean_match = re.search(r"mean_volume:\s*(-?[\d.]+)\s*dB", proc.stderr)
+        max_match = re.search(r"max_volume:\s*(-?[\d.]+)\s*dB", proc.stderr)
+        if mean_match:
+            stats["mean_volume_db"] = float(mean_match.group(1))
+        if max_match:
+            stats["max_volume_db"] = float(max_match.group(1))
+            stats["clipping_detected"] = float(max_match.group(1)) >= -0.1
+        stats["measured"] = bool(mean_match and max_match)
+    except Exception as exc:  # measurement must never fail the render
+        print(f"[WARN] audio measurement failed: {exc}")
+    return stats
+
+
 def fit_voice_to_scene(voice_dur: float, planned_dur: float) -> Tuple[float, str]:
     """Keep the planned shot length unless the voice is materially longer."""
     planned = max(1.0, float(planned_dur or 5.0))
@@ -1060,8 +1088,9 @@ def render_episode(req: FfmpegEpisodeRequest):
                 tmpdir, f"proj_{req.project_id[:8]}_ep_{req.episode_no}_master.mp4"
             )
 
+            bgm_gain_db = float(req.ducking_db if req.ducking_db is not None else -8.0)
             audio_filter = (
-                "[2:a]volume=0.38[bgm_low];"
+                f"[2:a]volume={bgm_gain_db}dB[bgm_low];"
                 "[bgm_low][1:a]sidechaincompress=threshold=0.025:ratio=4:attack=40:release=400[bgm_ducked];"
                 "[1:a][bgm_ducked][3:a]amix=inputs=3:duration=first:dropout_transition=0.5:normalize=0[a_mixed];"
                 f"[a_mixed]loudnorm=I={req.target_loudness_lufs}:TP=-1.5:LRA=11[audio_master]"
@@ -1117,6 +1146,7 @@ def render_episode(req: FfmpegEpisodeRequest):
                 f"Scenes: {len(sorted_scenes)} | Duration: {round(total_ep_duration, 1)}s"
             )
             tg_res = deliver_output(final_mp4, caption, req.telegram_upload)
+            audio_stats = measure_audio_stats(final_mp4)
 
             return {
                 "ok": True,
@@ -1126,6 +1156,7 @@ def render_episode(req: FfmpegEpisodeRequest):
                 "target_duration_sec": round(target_duration, 2) if target_duration > 0 else None,
                 "duration_delta_sec": round(duration_delta, 2) if target_duration > 0 else None,
                 "duration_status": duration_status,
+                "audio_stats": audio_stats,
                 "file_size_bytes": file_size,
                 "telegram_file_id": tg_res["file_id"],
                 "tg_file_id": tg_res["file_id"],
