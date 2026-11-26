@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: anime-cpu-worker
@@ -28,11 +28,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg fonts-noto fonts-deva
 
-      - name: Install Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
       - name: Install Python Dependencies
         run: |
           pip install -r requirements.txt
@@ -46,71 +41,15 @@ jobs:
             exit 1
           fi
 
-      - name: Start Worker and Tunnel
+      - name: Run Pull Worker
         env:
+          ANIME_BACKEND_URL: https://api.bnai.dpdns.org
+          WORKER_SERVICE_SECRET: ${{ secrets.WORKER_JOB_TOKEN_SECRET }}
           WORKER_JOB_TOKEN_SECRET: ${{ secrets.WORKER_JOB_TOKEN_SECRET }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_STORAGE_CHAT_ID: ${{ secrets.TELEGRAM_STORAGE_CHAT_ID }}
           SVARA_ENGINE_MODE: FAST_CPU_VITS
-          WORKER_TOKEN_SINGLE_USE: "false"
-          WORKER_HEALTH_PUBLIC: "true"
-          WORKER_SUBDOMAIN: ${{ vars.WORKER_SUBDOMAIN }}
-        run: |
-          set -euo pipefail
-          python main.py > worker.log 2>&1 &
-          worker_pid=$!
-          ready=0
-          for _ in $(seq 1 45); do
-            code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer invalid' http://127.0.0.1:8000/health || true)
-            if [ "$code" = "401" ] || [ "$code" = "200" ]; then
-              ready=1
-              break
-            fi
-            if ! kill -0 "$worker_pid" 2>/dev/null; then
-              echo "::error::Worker exited before becoming ready."
-              tail -n 120 worker.log
-              exit 1
-            fi
-            sleep 2
-          done
-          if [ "$ready" != "1" ]; then
-            echo "::error::Worker did not become ready."
-            tail -n 120 worker.log
-            exit 1
-          fi
-          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
-            -o /tmp/cloudflared
-          chmod +x /tmp/cloudflared
-
-          /tmp/cloudflared tunnel --url http://127.0.0.1:8000 --no-autoupdate \
-            > /tmp/cloudflared.log 2>&1 &
-          tunnel_pid=$!
-
-          tunnel_url=""
-          for _ in $(seq 1 60); do
-            tunnel_url=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1 || true)
-            if [ -n "$tunnel_url" ]; then
-              break
-            fi
-            if ! kill -0 "$tunnel_pid" 2>/dev/null; then
-              echo "::error::Cloudflare tunnel exited before publishing a URL."
-              tail -n 120 /tmp/cloudflared.log
-              exit 1
-            fi
-            sleep 2
-          done
-          if [ -z "$tunnel_url" ]; then
-            echo "::error::Cloudflare tunnel URL was not published."
-            tail -n 120 /tmp/cloudflared.log
-            exit 1
-          fi
-
-          echo "WORKER_TUNNEL_URL=$tunnel_url" >> "$GITHUB_STEP_SUMMARY"
-          echo "worker_tunnel_url=$tunnel_url"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          printf '%s' "$tunnel_url" > worker-url.txt
-          git add worker-url.txt
-          git commit -m "ci: publish worker tunnel url" >/dev/null
-          git push --force origin HEAD:ci/worker-url
-          tail -f /tmp/cloudflared.log
+          WORKER_ID: gh-${{ github.run_id }}
+          WORKER_IDLE_EXIT_SECONDS: "1800"
+          WORKER_MAX_LIFETIME_SECONDS: "21000"
+        run: python worker_poll.py
