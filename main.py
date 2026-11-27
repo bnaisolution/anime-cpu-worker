@@ -35,6 +35,7 @@ MAX_DOWNLOAD_BYTES = int(os.getenv("WORKER_MAX_DOWNLOAD_BYTES", str(200 * 1024 *
 SVARA_MODEL_ID = os.getenv("SVARA_MODEL_ID", "kenpath/svara-tts-v1")
 SNAC_MODEL_ID = os.getenv("SNAC_MODEL_ID", "hubertsiuzdak/snac_24khz")
 VITS_HINDI_MODEL_ID = os.getenv("VITS_HINDI_MODEL_ID", "facebook/mms-tts-hin")
+VITS_ENGLISH_MODEL_ID = os.getenv("VITS_ENGLISH_MODEL_ID", "facebook/mms-tts-eng")
 # Set SVARA_ENGINE_MODE="FULL_LLM" on 16GB+ RAM or GPU; "FAST_CPU_VITS" on 7GB GitHub Actions CPU
 SVARA_ENGINE_MODE = os.getenv("SVARA_ENGINE_MODE", "AUTO")
 
@@ -104,6 +105,7 @@ class TtsSynthesisRequest(BaseModel):
     episode_no: int
     scene_order: int
     provider: str = "Svara TTS"
+    language: str = "hi"
     voice_text: str
     voice_id: str = "svara_hi_male_hero_01"
     emotion: str = "neutral"
@@ -370,19 +372,22 @@ def load_svara_llm_engine():
     return TTS_CACHE["svara_llm"]
 
 
-def load_fast_hindi_vits_engine():
-    if "hindi_vits" in TTS_CACHE:
-        return TTS_CACHE["hindi_vits"]
+def load_fast_vits_engine(language: str = "hi"):
+    normalized_language = "en" if str(language).lower().startswith("en") else "hi"
+    cache_key = "english_vits" if normalized_language == "en" else "hindi_vits"
+    if cache_key in TTS_CACHE:
+        return TTS_CACHE[cache_key]
 
     from transformers import VitsModel, AutoTokenizer
 
+    model_id = VITS_ENGLISH_MODEL_ID if normalized_language == "en" else VITS_HINDI_MODEL_ID
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[SVARA-VITS] Loading dev/test VITS fallback {VITS_HINDI_MODEL_ID} on {device}...")
-    tokenizer = AutoTokenizer.from_pretrained(VITS_HINDI_MODEL_ID)
-    model = VitsModel.from_pretrained(VITS_HINDI_MODEL_ID).to(device)
+    print(f"[SVARA-VITS] Loading dev/test VITS fallback {model_id} ({normalized_language}) on {device}...")
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    model = VitsModel.from_pretrained(model_id).to(device)
     model.eval()
-    TTS_CACHE["hindi_vits"] = (tokenizer, model, device)
-    return TTS_CACHE["hindi_vits"]
+    TTS_CACHE[cache_key] = (tokenizer, model, device)
+    return TTS_CACHE[cache_key]
 
 
 def decode_svara_snac_tokens(generated_ids: List[int], snac_model: Any, device: str) -> Optional[np.ndarray]:
@@ -438,11 +443,13 @@ def synthesize_open_source_speech(
     voice_id: str,
     emotion: str,
     raw_wav_path: str,
+    language: str = "hi",
 ) -> str:
     """Runs Svara-TTS v1 (or fast VITS on low-RAM CPU runners) with zero Microsoft/Edge code."""
     profile = VOICE_ACOUSTIC_MAP.get(voice_id, VOICE_ACOUSTIC_MAP["svara_hi_male_hero_01"])
     emotion_tag = EMOTION_TAG_MAP.get(emotion.lower(), "neutral")
-    use_full_svara = (
+    normalized_language = "en" if str(language).lower().startswith("en") else "hi"
+    use_full_svara = normalized_language == "hi" and (
         SVARA_ENGINE_MODE.upper() == "FULL_LLM"
         or (SVARA_ENGINE_MODE.upper() == "AUTO" and torch.cuda.is_available())
     )
@@ -472,8 +479,8 @@ def synthesize_open_source_speech(
                 print(f"[SVARA LLM FALLBACK TO VITS] {e}")
 
         # Commercial-Safe Open-Source VITS Synthesis (Runs in <0.8s on GitHub Actions CPU)
-        tokenizer, model, device = load_fast_hindi_vits_engine()
-        norm_text = roman_hinglish_to_devanagari_fallback(text.strip())
+        tokenizer, model, device = load_fast_vits_engine(normalized_language)
+        norm_text = roman_hinglish_to_devanagari_fallback(text.strip()) if normalized_language == "hi" else text.strip()
         inputs = tokenizer(norm_text, return_tensors="pt").to(device)
         with torch.inference_mode():
             output = model(**inputs).waveform
@@ -496,7 +503,7 @@ def run_tts_pipeline(req: TtsSynthesisRequest) -> Dict[str, Any]:
             tmpdir, f"proj_{req.project_id[:8]}_ep{req.episode_no}_sc{req.scene_order}_voice.wav"
         )
 
-        synthesize_open_source_speech(req.voice_text, req.voice_id, req.emotion, raw_wav)
+        synthesize_open_source_speech(req.voice_text, req.voice_id, req.emotion, raw_wav, req.language)
 
         # Combine character base pitch/rate with scene emotion multipliers from storywf03
         total_pitch = max(
@@ -543,22 +550,29 @@ def run_tts_pipeline(req: TtsSynthesisRequest) -> Dict[str, Any]:
 
         caption = (
             f"🎙️ [{req.provider}] Project: {req.project_id} | Ep: {req.episode_no} | "
-            f"Scene: {req.scene_order} | Voice: {req.voice_id} ({req.emotion})"
+            f"Scene: {req.scene_order} | Voice: {req.voice_id} ({req.emotion}) | Language: {req.language}"
         )
         tg_res = deliver_output(final_wav, caption, req.telegram_upload)
-        full_svara = SVARA_ENGINE_MODE.upper() == "FULL_LLM" or (
-            SVARA_ENGINE_MODE.upper() == "AUTO" and torch.cuda.is_available()
+        normalized_language = "en" if str(req.language).lower().startswith("en") else "hi"
+        full_svara = normalized_language == "hi" and (
+            SVARA_ENGINE_MODE.upper() == "FULL_LLM"
+            or (SVARA_ENGINE_MODE.upper() == "AUTO" and torch.cuda.is_available())
         )
         license_label = (
             "Apache-2.0 (Svara-TTS/SNAC)"
             if full_svara
-            else "CC-BY-NC-4.0 (MMS Hindi VITS; DEV/TEST ONLY)"
+            else (
+                "CC-BY-NC-4.0 (MMS English VITS; DEV/TEST ONLY)"
+                if normalized_language == "en"
+                else "CC-BY-NC-4.0 (MMS Hindi VITS; DEV/TEST ONLY)"
+            )
         )
 
         return {
             "ok": True,
             "provider": req.provider,
             "license": license_label,
+            "language": normalized_language,
             "voice_id": req.voice_id,
             "duration_sec": round(duration_sec, 2),
             "file_size_bytes": file_size,
