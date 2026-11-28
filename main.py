@@ -122,14 +122,21 @@ class SfxTrackItem(BaseModel):
 
 class SceneManifestItem(BaseModel):
     scene_order: int
+    parent_scene_order: Optional[int] = None
     shot_id: Optional[str] = None
     shot_order: Optional[int] = None
     shot_type: Optional[str] = None
+    camera_idx: Optional[int] = None
+    transition_in: Optional[str] = None
+    transition_out: Optional[str] = None
+    first_frame_url: Optional[str] = None
+    last_frame_url: Optional[str] = None
     duration_sec: float = 5.0
     routing_type: str = "STATIC"
     camera_motion_type: str = "KEN_BURNS"
     camera_json: Optional[Dict[str, Any]] = None
     continuity_json: Optional[Dict[str, Any]] = None
+    scene_state_json: Optional[Dict[str, Any]] = None
     keyframe_url: Optional[str] = None
     video_input_url: Optional[str] = None
     image_input_url: Optional[str] = None
@@ -1025,11 +1032,18 @@ def render_single_scene_segment(
         "duration_sec": scene_dur,
         "subtitle_text": sc.subtitle_text,
         "scene_order": sc.scene_order,
+        "parent_scene_order": sc.parent_scene_order,
         "shot_id": sc.shot_id,
         "shot_order": sc.shot_order,
         "shot_type": sc.shot_type,
+        "camera_idx": sc.camera_idx,
+        "transition_in": sc.transition_in,
+        "transition_out": sc.transition_out,
+        "first_frame_url": sc.first_frame_url,
+        "last_frame_url": sc.last_frame_url,
         "camera_json": sc.camera_json,
         "continuity_json": sc.continuity_json,
+        "scene_state_json": sc.scene_state_json,
         "keyframe_url": sc.keyframe_url,
     }
 
@@ -1197,13 +1211,20 @@ def render_episode(req: FfmpegEpisodeRequest):
                 "artifact_manifest": [
                     {
                         "scene_order": seg.get("scene_order"),
+                        "parent_scene_order": seg.get("parent_scene_order"),
                         "shot_id": seg.get("shot_id"),
                         "shot_order": seg.get("shot_order"),
                         "shot_type": seg.get("shot_type"),
+                        "camera_idx": seg.get("camera_idx"),
+                        "transition_in": seg.get("transition_in"),
+                        "transition_out": seg.get("transition_out"),
+                        "first_frame_url": seg.get("first_frame_url"),
+                        "last_frame_url": seg.get("last_frame_url"),
                         "duration_sec": seg.get("duration_sec"),
                         "keyframe_url": seg.get("keyframe_url"),
                         "camera_json": seg.get("camera_json"),
                         "continuity_json": seg.get("continuity_json"),
+                        "scene_state_json": seg.get("scene_state_json"),
                     }
                     for seg in rendered_segments
                 ],

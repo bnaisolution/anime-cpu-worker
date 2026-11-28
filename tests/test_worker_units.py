@@ -278,7 +278,7 @@ def test_worker_schema_required_fields_match_workflow_contracts():
     assert scene["scene_order"] is False
     assert scene["duration_sec"] is True
     assert scene["sfx_tracks"] is True
-    for field in ("shot_id", "shot_order", "shot_type", "camera_json", "continuity_json", "keyframe_url"):
+    for field in ("shot_id", "shot_order", "shot_type", "camera_json", "continuity_json", "keyframe_url", "parent_scene_order", "camera_idx", "transition_in", "transition_out", "first_frame_url", "last_frame_url", "scene_state_json"):
         assert scene[field] is True
 
     assert schema_fields("SfxTrackItem")["sfx_code"] is True
