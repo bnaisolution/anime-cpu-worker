@@ -122,9 +122,15 @@ class SfxTrackItem(BaseModel):
 
 class SceneManifestItem(BaseModel):
     scene_order: int
+    shot_id: Optional[str] = None
+    shot_order: Optional[int] = None
+    shot_type: Optional[str] = None
     duration_sec: float = 5.0
     routing_type: str = "STATIC"
     camera_motion_type: str = "KEN_BURNS"
+    camera_json: Optional[Dict[str, Any]] = None
+    continuity_json: Optional[Dict[str, Any]] = None
+    keyframe_url: Optional[str] = None
     video_input_url: Optional[str] = None
     image_input_url: Optional[str] = None
     voice_audio_url: Optional[str] = None
@@ -1018,6 +1024,13 @@ def render_single_scene_segment(
         "sfx_path": seg_sfx_out,
         "duration_sec": scene_dur,
         "subtitle_text": sc.subtitle_text,
+        "scene_order": sc.scene_order,
+        "shot_id": sc.shot_id,
+        "shot_order": sc.shot_order,
+        "shot_type": sc.shot_type,
+        "camera_json": sc.camera_json,
+        "continuity_json": sc.continuity_json,
+        "keyframe_url": sc.keyframe_url,
     }
 
 
@@ -1031,7 +1044,10 @@ def render_episode(req: FfmpegEpisodeRequest):
 
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
-            sorted_scenes = sorted(req.scenes_manifest, key=lambda x: x.scene_order)
+            sorted_scenes = sorted(
+                req.scenes_manifest,
+                key=lambda x: (x.scene_order, x.shot_order if x.shot_order is not None else 0),
+            )
             rendered_segments = []
             subtitle_events = []
             cursor_sec = 0.0
@@ -1177,6 +1193,20 @@ def render_episode(req: FfmpegEpisodeRequest):
                 "telegram_url": tg_res["telegram_url"],
                 "final_video_url": tg_res["telegram_url"],
                 "output_url": tg_res["telegram_url"],
+                "shots_rendered": len(sorted_scenes),
+                "artifact_manifest": [
+                    {
+                        "scene_order": seg.get("scene_order"),
+                        "shot_id": seg.get("shot_id"),
+                        "shot_order": seg.get("shot_order"),
+                        "shot_type": seg.get("shot_type"),
+                        "duration_sec": seg.get("duration_sec"),
+                        "keyframe_url": seg.get("keyframe_url"),
+                        "camera_json": seg.get("camera_json"),
+                        "continuity_json": seg.get("continuity_json"),
+                    }
+                    for seg in rendered_segments
+                ],
             }
     except subprocess.CalledProcessError as cpe:
         raise HTTPException(status_code=500, detail=f"FFmpeg execution error: {cpe}")

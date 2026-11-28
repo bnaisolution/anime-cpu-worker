@@ -278,6 +278,8 @@ def test_worker_schema_required_fields_match_workflow_contracts():
     assert scene["scene_order"] is False
     assert scene["duration_sec"] is True
     assert scene["sfx_tracks"] is True
+    for field in ("shot_id", "shot_order", "shot_type", "camera_json", "continuity_json", "keyframe_url"):
+        assert scene[field] is True
 
     assert schema_fields("SfxTrackItem")["sfx_code"] is True
     assert schema_fields("TelegramUploadConfig")["enabled"] is True
